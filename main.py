@@ -10,7 +10,6 @@ import unicodedata
 import time
 from datetime import timedelta
 from typing import List, Tuple, Optional, Dict, Any
-
 from google.cloud import storage
 from pdf2image import convert_from_path
 
