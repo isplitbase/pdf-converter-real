@@ -10,6 +10,7 @@ import unicodedata
 import time
 from datetime import timedelta
 from typing import List, Tuple, Optional, Dict, Any
+
 from google.cloud import storage
 from pdf2image import convert_from_path
 
@@ -453,6 +454,172 @@ def resize_image_to_canvas(
         return False
 
 
+def downsample_if_too_large(
+    image_path: str,
+    size_threshold_bytes: int = 5 * 1024 * 1024,
+    target_long_edge_px: int = 1754,  # A4 を 150 DPI で描画した時の長辺 px (11.69" * 150 ≈ 1754)
+) -> bool:
+    """
+    画像ファイルが size_threshold_bytes (既定 5MB) を超えていたら、
+    アスペクト比を保ったまま長辺を target_long_edge_px (既定 1754 ≒ A4@150DPI) に
+    収まるように縮小して上書き保存する。
+
+    意図:
+      PDF→PNG が GS_DPI=400 で大きく作られて 5MB 超になるケースがある。
+      これをそのまま PIL.Image.open / resize に渡すと OOM や CPU 100% で
+      スタックする恐れがあるため、事前に 150DPI 相当までダウンサンプルする。
+
+    戻り値:
+      True: 縮小して上書きした
+      False: 縮小不要 or 失敗
+    """
+    try:
+        size_bytes = os.path.getsize(image_path)
+    except Exception as e:
+        log_json({"ok": False, "stage": "downsample_getsize_error", "path": image_path, "error": str(e)})
+        return False
+
+    if size_bytes <= size_threshold_bytes:
+        log_json({
+            "ok": True,
+            "stage": "downsample_not_needed_size",
+            "path": os.path.basename(image_path),
+            "size_bytes": size_bytes,
+            "size_threshold_bytes": size_threshold_bytes,
+        })
+        return False
+
+    try:
+        from PIL import Image as _PilImage
+        # 巨大画像でも開けるよう DecompressionBomb 制限を緩める
+        _PilImage.MAX_IMAGE_PIXELS = None
+
+        with _PilImage.open(image_path) as img:
+            w, h = img.size
+            log_json({
+                "ok": True,
+                "stage": "downsample_inspect",
+                "path": os.path.basename(image_path),
+                "size_bytes": size_bytes,
+                "w": w,
+                "h": h,
+                "target_long_edge_px": target_long_edge_px,
+            })
+            if max(w, h) <= target_long_edge_px:
+                log_json({
+                    "ok": True,
+                    "stage": "downsample_skip_already_small_dim",
+                    "path": os.path.basename(image_path),
+                    "w": w,
+                    "h": h,
+                    "target_long_edge_px": target_long_edge_px,
+                })
+                return False
+
+            # 縦横比を保ったまま長辺を target_long_edge_px に合わせる（≒150 DPI 相当）
+            if w >= h:
+                new_w = target_long_edge_px
+                new_h = max(1, int(round(h * target_long_edge_px / w)))
+            else:
+                new_h = target_long_edge_px
+                new_w = max(1, int(round(w * target_long_edge_px / h)))
+
+            resized = img.resize((new_w, new_h), _PilImage.LANCZOS)
+            ext = os.path.splitext(image_path)[1].lower()
+            if ext in (".jpg", ".jpeg"):
+                if resized.mode != "RGB":
+                    resized = resized.convert("RGB")
+                resized.save(image_path, "JPEG", quality=90)
+            else:
+                # PNG（または不明）は PNG で上書き
+                resized.save(image_path, "PNG", optimize=True)
+
+        new_size = os.path.getsize(image_path)
+        log_json({
+            "ok": True,
+            "stage": "downsample_applied",
+            "path": os.path.basename(image_path),
+            "before_bytes": size_bytes,
+            "after_bytes": new_size,
+            "before_size": f"{w}x{h}",
+            "after_size": f"{new_w}x{new_h}",
+            "target_long_edge_px": target_long_edge_px,
+            "effective_dpi_a4": "≈150",
+        })
+        return True
+    except Exception as e:
+        log_json({"ok": False, "stage": "downsample_error", "path": image_path, "error": str(e)})
+        return False
+
+
+def gcs_upload_with_retry(
+    blob,
+    local_path: str,
+    content_type: str,
+    timeout: int = 60,
+    max_attempts: int = 3,
+) -> bool:
+    """
+    GCS への upload_from_filename をタイムアウト＆指数バックオフ付きで実行する。
+      - timeout: 1試行あたりのHTTP timeout（秒）
+      - max_attempts: 最大試行回数（既定 3）
+      - バックオフ: 1.0秒 → 2.0秒 → 4.0秒
+    成功なら True を返す。すべて失敗した場合は最後の例外を再送出する。
+    各試行の開始/完了/失敗は log_json で stage を吐く。
+    """
+    delays = [1.0, 2.0, 4.0]
+    last_err: Optional[Exception] = None
+    try:
+        size_bytes = os.path.getsize(local_path)
+    except Exception:
+        size_bytes = -1
+    for attempt in range(1, max_attempts + 1):
+        log_json({
+            "ok": True,
+            "stage": "gcs_upload_attempt",
+            "blob": getattr(blob, "name", str(blob)),
+            "size_bytes": size_bytes,
+            "timeout": timeout,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+        })
+        try:
+            blob.upload_from_filename(
+                local_path,
+                content_type=content_type,
+                timeout=timeout,
+            )
+            log_json({
+                "ok": True,
+                "stage": "gcs_upload_done",
+                "blob": getattr(blob, "name", str(blob)),
+                "size_bytes": size_bytes,
+                "attempt": attempt,
+            })
+            return True
+        except Exception as e:
+            last_err = e
+            log_json({
+                "ok": False,
+                "stage": "gcs_upload_attempt_failed",
+                "blob": getattr(blob, "name", str(blob)),
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "error": str(e),
+            })
+            if attempt < max_attempts:
+                wait = delays[min(attempt - 1, len(delays) - 1)]
+                log_json({
+                    "ok": True,
+                    "stage": "gcs_upload_backoff_sleep",
+                    "blob": getattr(blob, "name", str(blob)),
+                    "next_attempt": attempt + 1,
+                    "sleep_seconds": wait,
+                })
+                time.sleep(wait)
+    raise last_err if last_err is not None else RuntimeError("GCS upload: 全リトライ失敗")
+
+
 def generate_gcs_signed_url(blob_obj, expiration_hours: int = 168) -> Optional[str]:
     """
     GCS blob の署名付きURL（v4）を生成する。
@@ -510,6 +677,12 @@ def call_azure_ocr(image_path: str) -> Dict[str, Any]:
     Azure Form Recognizer (prebuilt-read) を呼び出す。
     azure_ai.py と同じ API・同じレスポンス形式。
     返り値: {"text_annotations": [{"description": "全テキスト"}]}
+
+    タイムアウト方針（2026-05 改修）:
+      - POST(解析リクエスト送信)        : 120 秒
+      - ポーリング(1回ごと)             : 60 秒
+      - ポーリング回数                  : 最大 120 回（≒最大 120 秒）
+      （※実呼び出し側で指数バックオフリトライを行う）
     """
     global AZURE_KEY, AZURE_ENDPOINT
     if not AZURE_KEY or not AZURE_ENDPOINT:
@@ -532,21 +705,21 @@ def call_azure_ocr(image_path: str) -> Dict[str, Any]:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
         operation_url = resp.headers.get("Operation-Location")
 
     if not operation_url:
         raise RuntimeError("Azure OCR: Operation-Location ヘッダーが取得できませんでした")
 
-    # Step2: ポーリング（azure_ai.py と同じ: 1秒ごと・最大60回）
+    # Step2: ポーリング（1秒ごと・最大 120 回 ≒ 約 120 秒）
     result = {}
-    for _ in range(60):
+    for _ in range(120):
         time.sleep(1)
         poll_req = urllib.request.Request(
             operation_url,
             headers={"Ocp-Apim-Subscription-Key": AZURE_KEY},
         )
-        with urllib.request.urlopen(poll_req, timeout=30) as poll_resp:
+        with urllib.request.urlopen(poll_req, timeout=60) as poll_resp:
             result = json.loads(poll_resp.read().decode("utf-8"))
         status = result.get("status")
         if status == "succeeded":
@@ -555,12 +728,56 @@ def call_azure_ocr(image_path: str) -> Dict[str, Any]:
             raise RuntimeError("Azure OCR 解析失敗（status=failed）")
         # "running" / "notStarted" → 続けてポーリング
     else:
-        raise RuntimeError("Azure OCR タイムアウト（60秒超）")
+        raise RuntimeError("Azure OCR タイムアウト（120秒超）")
 
     # Step3: azure_ai.py と同じ: analyzeResult.content から全テキスト取得
     azure_text = result["analyzeResult"]["content"]
 
     return {"text_annotations": [{"description": azure_text}]}
+
+
+def call_azure_ocr_with_retry(image_path: str, max_attempts: int = 3) -> Dict[str, Any]:
+    """
+    call_azure_ocr() を指数バックオフ付きでリトライするラッパー。
+      - 試行回数: 最大 max_attempts 回（既定 3）
+      - バックオフ待機: 1.5秒 → 3秒 → 6秒（試行間で2倍）
+      - 全試行失敗時は最後の例外を再送出する（呼び出し側で捕捉してデフォルト値を入れる想定）
+    """
+    delays = [1.5, 3.0, 6.0]
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = call_azure_ocr(image_path)
+            if attempt > 1:
+                log_json({
+                    "ok": True,
+                    "stage": "azure_ocr_retry_succeeded",
+                    "image": os.path.basename(image_path),
+                    "attempt": attempt,
+                })
+            return result
+        except Exception as e:
+            last_err = e
+            log_json({
+                "ok": False,
+                "stage": "azure_ocr_attempt_failed",
+                "image": os.path.basename(image_path),
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "error": str(e),
+            })
+            if attempt < max_attempts:
+                wait = delays[min(attempt - 1, len(delays) - 1)]
+                log_json({
+                    "ok": True,
+                    "stage": "azure_ocr_backoff_sleep",
+                    "image": os.path.basename(image_path),
+                    "next_attempt": attempt + 1,
+                    "sleep_seconds": wait,
+                })
+                time.sleep(wait)
+    # 全試行失敗
+    raise last_err if last_err is not None else RuntimeError("Azure OCR: 全リトライ失敗")
 
 
 # =============================
@@ -968,31 +1185,55 @@ def main() -> Dict[str, Any]:
             for i, path in enumerate(png_paths, start=1):
                 idx = format_index(i)
                 out_obj = f"{out_prefix}{idx}.png"
-                bucket_out.blob(out_obj).upload_from_filename(
-                    path,
-                    content_type="image/png"
-                )
-                uploaded.append(f"gs://{out_bucket}/{out_obj}")
+                log_json({"ok": True, "stage": "page_loop_start", "page_idx": i, "idx_str": idx, "png_path": os.path.basename(path)})
 
-                # 画像サイズ取得
+                # ---- 事前ダウンサンプル：ファイルサイズが大きすぎる場合は縮小 ----
+                # 5MB を超え、かつ縦横どちらかが 4500px を超えるなら、縦横比維持で 4500px に縮小
+                # （巨大画像での PIL ハング / OOM 防止のため）
+                downsample_if_too_large(path, size_threshold_bytes=5 * 1024 * 1024, target_long_edge_px=1754)
+
+                # ---- PNG を GCS にアップロード（リトライ・タイムアウト付き） ----
+                log_json({"ok": True, "stage": "png_upload_start", "page_idx": i, "out_obj": out_obj})
+                try:
+                    gcs_upload_with_retry(
+                        bucket_out.blob(out_obj),
+                        path,
+                        content_type="image/png",
+                        timeout=60,
+                        max_attempts=3,
+                    )
+                except Exception as png_upload_err:
+                    log_json({"ok": False, "stage": "png_upload_error", "page_idx": i, "out_obj": out_obj, "error": str(png_upload_err)})
+                    # GCS アップロード失敗。後段のため gs:// URI は付与するが、対象外として扱われる可能性あり。
+                uploaded.append(f"gs://{out_bucket}/{out_obj}")
+                log_json({"ok": True, "stage": "png_upload_complete", "page_idx": i, "out_obj": out_obj})
+
+                # ---- 画像サイズ取得（PIL） ----
+                log_json({"ok": True, "stage": "pil_size_start", "page_idx": i, "png_path": os.path.basename(path)})
                 try:
                     from PIL import Image as _PilImage
                     with _PilImage.open(path) as pil_img:
                         w_px, h_px = pil_img.size
                     all_image_sizes.append(f"{w_px}x{h_px}")
+                    log_json({"ok": True, "stage": "pil_size_done", "page_idx": i, "size": f"{w_px}x{h_px}"})
                 except Exception as size_err:
                     log_json({"ok": False, "stage": "image_size_error", "path": path, "error": str(size_err)})
                     all_image_sizes.append("unknown")
 
-                # リサイズ → _mini.jpg をGCSアップロード → 署名付きURL生成
+                # ---- リサイズ → _mini.jpg をGCSアップロード → 署名付きURL生成 ----
                 mini_path = os.path.splitext(path)[0] + "_mini.jpg"
                 mini_obj = f"{out_prefix}{idx}_mini.jpg"
                 signed_url: Optional[str] = None
-                if resize_image_to_canvas(path, mini_path):
+                log_json({"ok": True, "stage": "resize_canvas_start", "page_idx": i, "mini_path": os.path.basename(mini_path)})
+                resize_ok = resize_image_to_canvas(path, mini_path)
+                log_json({"ok": True, "stage": "resize_canvas_done", "page_idx": i, "resize_ok": resize_ok})
+                if resize_ok:
                     # _mini.jpg が 1MB を超える場合、縦横を50%に縮小して再保存
+                    log_json({"ok": True, "stage": "mini_size_check_start", "page_idx": i})
                     try:
                         mini_size_before = os.path.getsize(mini_path)
                         if mini_size_before > 1024 * 1024:
+                            log_json({"ok": True, "stage": "mini_resize_50pct_start", "page_idx": i, "before_bytes": mini_size_before})
                             from PIL import Image as _PilImage
                             with _PilImage.open(mini_path) as mini_img:
                                 new_w = max(1, mini_img.width // 2)
@@ -1004,33 +1245,42 @@ def main() -> Dict[str, Any]:
                             log_json({
                                 "ok": True,
                                 "stage": "mini_resize_50pct",
+                                "page_idx": i,
                                 "before_bytes": mini_size_before,
                                 "after_bytes": os.path.getsize(mini_path),
                             })
                     except Exception as mini_shrink_err:
-                        log_json({"ok": False, "stage": "mini_resize_50pct_error", "error": str(mini_shrink_err)})
+                        log_json({"ok": False, "stage": "mini_resize_50pct_error", "page_idx": i, "error": str(mini_shrink_err)})
+                    log_json({"ok": True, "stage": "mini_upload_start", "page_idx": i, "mini_obj": mini_obj})
                     try:
                         mini_blob = bucket_out.blob(mini_obj)
-                        mini_blob.upload_from_filename(mini_path, content_type="image/jpeg")
+                        gcs_upload_with_retry(
+                            mini_blob,
+                            mini_path,
+                            content_type="image/jpeg",
+                            timeout=60,
+                            max_attempts=3,
+                        )
                         signed_url = generate_gcs_signed_url(mini_blob, expiration_hours=168)  # 1週間
                         log_json({
                             "ok": True,
                             "stage": "mini_upload",
+                            "page_idx": i,
                             "gcs": f"gs://{out_bucket}/{mini_obj}",
                             "signed_url_ok": signed_url is not None,
                         })
                     except Exception as mini_err:
-                        log_json({"ok": False, "stage": "mini_upload_error", "error": str(mini_err)})
+                        log_json({"ok": False, "stage": "mini_upload_error", "page_idx": i, "error": str(mini_err)})
                 else:
-                    log_json({"ok": False, "stage": "mini_resize_skip", "image": os.path.basename(path)})
+                    log_json({"ok": False, "stage": "mini_resize_skip", "page_idx": i, "image": os.path.basename(path)})
                 # 署名付きURL取得失敗時は gs:// URI にフォールバック
                 all_signed_urls.append(signed_url or f"gs://{out_bucket}/{mini_obj}")
 
-                # Azure OCR
+                # Azure OCR（指数バックオフリトライ付き）
                 post_progress(f"{img_cont}番目画像の帳票種類識別中")
                 img_cont += 1
                 try:
-                    ocr_result = call_azure_ocr(path)
+                    ocr_result = call_azure_ocr_with_retry(path, max_attempts=3)
                     azure_text = ocr_result["text_annotations"][0]["description"]
                     all_ocr_results.append(ocr_result)
                     log_json({
@@ -1041,8 +1291,19 @@ def main() -> Dict[str, Any]:
                         "text_preview": azure_text[:300],  # 最初の300文字をログ出力
                     })
                 except Exception as ocr_err:
-                    log_json({"ok": False, "stage": "azure_ocr_error", "image": os.path.basename(path), "error": str(ocr_err)})
-                    all_ocr_results.append({"text_annotations": [{"description": ""}]})
+                    # 全リトライ失敗 → 空テキスト + _ocr_failed フラグを付けて記録
+                    # 後段のページ分類で "BS or PL" にデフォルト設定する
+                    log_json({
+                        "ok": False,
+                        "stage": "azure_ocr_error",
+                        "image": os.path.basename(path),
+                        "error": str(ocr_err),
+                        "all_retries_failed": True,
+                    })
+                    all_ocr_results.append({
+                        "text_annotations": [{"description": ""}],
+                        "_ocr_failed": True,
+                    })
 
                 all_page_upload_keys.append(ufkey)
                 all_pdf_names.append(pdf_basename)
@@ -1069,9 +1330,27 @@ def main() -> Dict[str, Any]:
     page_classifications = []
     for ocr in all_ocr_results:
         text = ""
-        if isinstance(ocr, dict) and ocr.get("text_annotations"):
-            text = ocr["text_annotations"][0].get("description", "")
-        page_classifications.append(_classify_page(text))
+        ocr_failed = False
+        if isinstance(ocr, dict):
+            if ocr.get("text_annotations"):
+                text = ocr["text_annotations"][0].get("description", "")
+            ocr_failed = bool(ocr.get("_ocr_failed"))
+        if ocr_failed:
+            # OCR が全リトライ失敗した場合は明示的に "BS or PL" をデフォルトに設定
+            page_classifications.append({
+                "type": "BS or PL",
+                "firstHalfMatch": [],
+                "secondHalfMatch": [],
+                "_ocr_failed_default": True,
+            })
+            log_json({
+                "ok": True,
+                "stage": "classify_default_applied",
+                "default_type": "BS or PL",
+                "reason": "azure_ocr_all_retries_failed",
+            })
+        else:
+            page_classifications.append(_classify_page(text))
 
     # ファイルキーごとの PL/BS 数カウント
     plbs_counts_per_file: Dict[str, Dict[str, int]] = {}
