@@ -31,8 +31,8 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "converted").strip()
 TARGET_W = int(os.environ.get("TARGET_W", "3307"))
 TARGET_H = int(os.environ.get("TARGET_H", "4677"))
 USE_CROPBOX = os.environ.get("USE_CROPBOX", "true").lower() in ("1", "true", "yes", "y")
-THREAD_COUNT = int(os.environ.get("THREAD_COUNT", "1"))
-GS_DPI = int(os.environ.get("GS_DPI", "400"))
+THREAD_COUNT = int(os.environ.get("THREAD_COUNT", "2"))
+GS_DPI = int(os.environ.get("GS_DPI", "300"))
 NUMBER_FORMAT = os.environ.get("NUMBER_FORMAT", "03d")
 
 MYSQL_CHECK = os.environ.get("MYSQL_CHECK", "true").lower() in ("1", "true", "yes", "y")
@@ -465,7 +465,7 @@ def downsample_if_too_large(
     収まるように縮小して上書き保存する。
 
     意図:
-      PDF→PNG が GS_DPI=400 で大きく作られて 5MB 超になるケースがある。
+      PDF→PNG が GS_DPI=300 で大きく作られて 5MB 超になるケースがある。
       これをそのまま PIL.Image.open / resize に渡すと OOM や CPU 100% で
       スタックする恐れがあるため、事前に 150DPI 相当までダウンサンプルする。
 
@@ -1193,6 +1193,8 @@ def main() -> Dict[str, Any]:
                 downsample_if_too_large(path, size_threshold_bytes=5 * 1024 * 1024, target_long_edge_px=1754)
 
                 # ---- PNG を GCS にアップロード（リトライ・タイムアウト付き） ----
+                # 失敗時は uploaded に gs:// URI を追加せず、例外を再送出してジョブを止める。
+                # （壊れた URI を DB に書き込まないため）
                 log_json({"ok": True, "stage": "png_upload_start", "page_idx": i, "out_obj": out_obj})
                 try:
                     gcs_upload_with_retry(
@@ -1203,8 +1205,15 @@ def main() -> Dict[str, Any]:
                         max_attempts=3,
                     )
                 except Exception as png_upload_err:
-                    log_json({"ok": False, "stage": "png_upload_error", "page_idx": i, "out_obj": out_obj, "error": str(png_upload_err)})
-                    # GCS アップロード失敗。後段のため gs:// URI は付与するが、対象外として扱われる可能性あり。
+                    log_json({
+                        "ok": False,
+                        "stage": "png_upload_error",
+                        "page_idx": i,
+                        "out_obj": out_obj,
+                        "error": str(png_upload_err),
+                        "action": "raise_to_abort_job",
+                    })
+                    raise
                 uploaded.append(f"gs://{out_bucket}/{out_obj}")
                 log_json({"ok": True, "stage": "png_upload_complete", "page_idx": i, "out_obj": out_obj})
 
@@ -1463,4 +1472,4 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         log_json({"ok": False, "error": str(e)})
-        raise
+        rai
