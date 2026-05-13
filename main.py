@@ -989,6 +989,26 @@ def main() -> Dict[str, Any]:
                 mini_obj = f"{out_prefix}{idx}_mini.jpg"
                 signed_url: Optional[str] = None
                 if resize_image_to_canvas(path, mini_path):
+                    # _mini.jpg が 1MB を超える場合、縦横を50%に縮小して再保存
+                    try:
+                        mini_size_before = os.path.getsize(mini_path)
+                        if mini_size_before > 1024 * 1024:
+                            from PIL import Image as _PilImage
+                            with _PilImage.open(mini_path) as mini_img:
+                                new_w = max(1, mini_img.width // 2)
+                                new_h = max(1, mini_img.height // 2)
+                                resized_mini = mini_img.resize((new_w, new_h), _PilImage.LANCZOS)
+                                if resized_mini.mode != "RGB":
+                                    resized_mini = resized_mini.convert("RGB")
+                                resized_mini.save(mini_path, "JPEG", quality=90)
+                            log_json({
+                                "ok": True,
+                                "stage": "mini_resize_50pct",
+                                "before_bytes": mini_size_before,
+                                "after_bytes": os.path.getsize(mini_path),
+                            })
+                    except Exception as mini_shrink_err:
+                        log_json({"ok": False, "stage": "mini_resize_50pct_error", "error": str(mini_shrink_err)})
                     try:
                         mini_blob = bucket_out.blob(mini_obj)
                         mini_blob.upload_from_filename(mini_path, content_type="image/jpeg")
