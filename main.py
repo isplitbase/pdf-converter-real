@@ -35,6 +35,11 @@ THREAD_COUNT = int(os.environ.get("THREAD_COUNT", "2"))
 GS_DPI = int(os.environ.get("GS_DPI", "300"))
 NUMBER_FORMAT = os.environ.get("NUMBER_FORMAT", "03d")
 
+# Ghostscript 1ファイルあたりの実行時間上限(秒)。
+# timeout を指定しないと gs がハングした際に Cloud Run のリクエスト上限(既定3600秒)まで
+# インスタンスを占有し続けてしまうため、必ず上限を設ける。
+GS_TIMEOUT_SEC = int(os.environ.get("GS_TIMEOUT_SEC", "600"))
+
 MYSQL_CHECK = os.environ.get("MYSQL_CHECK", "true").lower() in ("1", "true", "yes", "y")
 MYSQL_HOST = os.environ.get("MYSQL_HOST", "10.146.0.2").strip()
 MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
@@ -130,7 +135,30 @@ def run_ghostscript_normalize(in_pdf: str, out_pdf: str) -> None:
         in_pdf,
     ]
 
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # NOTE: Ghostscript は PDF のメタデータ(Producer 等)をそのまま出力することがあり、
+    #       Latin-1 の (R)=0xAE / (C)=0xA9 のような UTF-8 として不正なバイトが混ざる。
+    #       errors="replace" が無いと UnicodeDecodeError になり PDF 変換全体が失敗する。
+    #       例: Producer が "iText(R) Core 7.2.5 ... (C)2000-2023 iText Group NV" の PDF
+    try:
+        r = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=GS_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        log_json({
+            "ok": False,
+            "stage": "ghostscript_timeout",
+            "timeout_sec": GS_TIMEOUT_SEC,
+            "in_pdf": os.path.basename(in_pdf),
+        })
+        raise RuntimeError(
+            f"Ghostscript timed out after {GS_TIMEOUT_SEC}s: {os.path.basename(in_pdf)}"
+        )
+
     if r.returncode != 0:
         raise RuntimeError(
             f"Ghostscript failed (code={r.returncode}). stderr:\n{r.stderr[-2000:]}"
@@ -355,6 +383,46 @@ def mysql_update_ai_case_img_urls(ai_case_id: str, img_urls_joined: str) -> Tupl
             conn.close()
 
         return True, f"updated: db={db}, affected_rows={affected}"
+    except Exception as e:
+        return False, f"update_failed: {e}"
+
+
+def mysql_update_ai_case_status(ai_case_id: str, status: str) -> Tuple[bool, str]:
+    """ai_case.status を更新する。変換失敗時に 'AIERR' を立てるために使う。
+
+    これが無いと、変換が失敗しても ai_case.status は upload_files.php が付けた
+    'UPST'(=画面表示は「帳票識別中」) のまま永久に残り、利用者からは
+    「ずっと処理中」に見えてしまう。
+    """
+    if not ai_case_id:
+        return False, "skip_update: ai_case_id is empty"
+    if not MYSQL_USER:
+        return False, "skip_update: MYSQL_USER is empty"
+    if pymysql is None:
+        return False, "pymysql_not_installed"
+
+    try:
+        if MYSQL_DB:
+            db = MYSQL_DB
+        else:
+            conn0 = mysql_connect(None)
+            try:
+                db = detect_db_with_ai_case(conn0)
+            finally:
+                conn0.close()
+            if not db:
+                return False, "skip_update: MYSQL_DB is empty and ai_case table not found"
+
+        conn = mysql_connect(db)
+        try:
+            with conn.cursor() as cur:
+                sql = f"UPDATE `{db}`.`ai_case` SET status=%s, update_at=NOW() WHERE ai_case_id=%s"
+                cur.execute(sql, (status, ai_case_id))
+                affected = cur.rowcount
+        finally:
+            conn.close()
+
+        return True, f"updated: db={db}, status={status}, affected_rows={affected}"
     except Exception as e:
         return False, f"update_failed: {e}"
 

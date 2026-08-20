@@ -1,5 +1,6 @@
 import os
 import json
+import traceback
 from typing import List, Optional, Any, Dict
 
 from fastapi import FastAPI, HTTPException
@@ -102,4 +103,28 @@ def convert(req: ConvertRequest):
     except HTTPException:
         raise
     except Exception as e:
+        # 例外の内容は HTTPException の detail (レスポンス本文) にしか載らないが、
+        # 呼び出し元の upload_files.php は送信後すぐ切断するため誰も読めない。
+        # 原因調査ができるよう、必ず Cloud Logging にも残す。
+        try:
+            conv.log_json({
+                "ok": False,
+                "stage": "convert_unhandled_exception",
+                "ai_case_id": str(req.ai_case_id or ""),
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            })
+        except Exception:
+            traceback.print_exc()
+
+        # 変換が失敗したことを DB に記録する。
+        # これが無いと ai_case.status は 'UPST' のまま残り、画面上は
+        # 「帳票識別中」で止まったように見えてしまう。
+        try:
+            ok, msg = conv.mysql_update_ai_case_status(str(req.ai_case_id or ""), "AIERR")
+            conv.log_json({"ok": ok, "stage": "mark_ai_case_error", "detail": msg})
+        except Exception as e2:
+            conv.log_json({"ok": False, "stage": "mark_ai_case_error_failed", "error": str(e2)})
+
         raise HTTPException(status_code=500, detail=str(e))
