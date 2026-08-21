@@ -122,7 +122,10 @@ def convert(req: ConvertRequest):
         # これが無いと ai_case.status は 'UPST' のまま残り、画面上は
         # 「帳票識別中」で止まったように見えてしまう。
         try:
-            ok, msg = conv.mysql_update_ai_case_status(str(req.ai_case_id or ""), "AIERR")
+            ok, msg = conv.retry_db_update(
+                "mark_ai_case_error",
+                lambda: conv.mysql_update_ai_case_status(str(req.ai_case_id or ""), "AIERR"),
+            )
             conv.log_json({"ok": ok, "stage": "mark_ai_case_error", "detail": msg})
         except Exception as e2:
             conv.log_json({"ok": False, "stage": "mark_ai_case_error_failed", "error": str(e2)})

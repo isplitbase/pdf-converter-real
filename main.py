@@ -40,6 +40,18 @@ NUMBER_FORMAT = os.environ.get("NUMBER_FORMAT", "03d")
 # インスタンスを占有し続けてしまうため、必ず上限を設ける。
 GS_TIMEOUT_SEC = int(os.environ.get("GS_TIMEOUT_SEC", "600"))
 
+# 一過性エラー時の試行回数（1 にするとリトライ無し）。
+# 入力PDFが不正な場合など「何度やっても直らない」エラーはリトライしない。
+GS_MAX_ATTEMPTS = int(os.environ.get("GS_MAX_ATTEMPTS", "2"))
+RENDER_MAX_ATTEMPTS = int(os.environ.get("RENDER_MAX_ATTEMPTS", "2"))
+GCS_MAX_ATTEMPTS = int(os.environ.get("GCS_MAX_ATTEMPTS", "3"))
+MYSQL_MAX_ATTEMPTS = int(os.environ.get("MYSQL_MAX_ATTEMPTS", "3"))
+
+# Pillow の decompression bomb 対策の上限(ピクセル数)。
+# None(無制限) にすると破損画像や極端に大きい画像でメモリを食い尽くすため上限を設ける。
+# 参考: A4 400dpi = 3307x4677 = 約1,547万px。既定はその約30倍。
+MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "500000000"))
+
 MYSQL_CHECK = os.environ.get("MYSQL_CHECK", "true").lower() in ("1", "true", "yes", "y")
 MYSQL_HOST = os.environ.get("MYSQL_HOST", "10.146.0.2").strip()
 MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
@@ -103,6 +115,109 @@ def format_index(i: int) -> str:
         return f"{i:03d}"
 
 
+# =============================
+# Retry helpers
+# =============================
+class PermanentConversionError(RuntimeError):
+    """入力PDFに起因するなど、リトライしても直らない変換エラー。"""
+
+
+# 一過性(リトライする価値がある)と判断する例外型
+_TRANSIENT_EXC_TYPES = (
+    ConnectionError,
+    TimeoutError,
+    socket.timeout,
+    socket.gaierror,
+)
+
+# 例外メッセージに含まれていれば一過性とみなす文字列
+_TRANSIENT_MSG_HINTS = (
+    "timed out", "timeout", "connection reset", "connection aborted",
+    "broken pipe", "temporarily unavailable", "service unavailable",
+    "bad gateway", "deadline exceeded", "try again", "remote end closed",
+    " 429", " 500", " 502", " 503", " 504",
+)
+
+
+def is_transient_error(e: BaseException) -> bool:
+    """一過性の障害（リトライで直る可能性がある）かどうかを判定する。
+
+    入力PDFが不正な場合のように「何度やっても直らない」エラーをリトライすると、
+    処理時間と OCR/AI の費用を無駄に消費するため、明確に一過性のものだけを対象にする。
+    """
+    if isinstance(e, PermanentConversionError):
+        return False
+    if isinstance(e, ValueError):
+        # UnicodeDecodeError もここに含まれる（入力データ起因なのでリトライしない）
+        return False
+    if isinstance(e, _TRANSIENT_EXC_TYPES):
+        return True
+    msg = str(e).lower()
+    return any(h in msg for h in _TRANSIENT_MSG_HINTS)
+
+
+def retry_on_transient(label: str, func, max_attempts: int, delays=(1.0, 2.0, 4.0)):
+    """func() を実行し、一過性エラーのときだけ指数バックオフでリトライする。
+
+    一過性でないと判定した例外は即座に送出する（無駄なリトライをしない）。
+    """
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func()
+        except Exception as e:
+            last_err = e
+            transient = is_transient_error(e)
+            log_json({
+                "ok": False,
+                "stage": f"{label}_attempt_failed",
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "transient": transient,
+                "error_type": type(e).__name__,
+                "error": str(e)[:500],
+            })
+            if not transient or attempt >= max_attempts:
+                raise
+            wait = delays[min(attempt - 1, len(delays) - 1)]
+            log_json({
+                "ok": True,
+                "stage": f"{label}_backoff_sleep",
+                "next_attempt": attempt + 1,
+                "sleep_seconds": wait,
+            })
+            time.sleep(wait)
+    raise last_err if last_err is not None else RuntimeError(f"{label}: 全リトライ失敗")
+
+
+def retry_db_update(label: str, func, max_attempts: int = None):
+    """(ok, message) を返す DB 更新関数を、失敗時にリトライする。
+
+    DB の一時的な混雑や接続切れで img_urls / status の書き込みが落ちると、
+    案件が 'UPST'(画面表示「帳票識別中」) のまま取り残されるため、必ずリトライする。
+    """
+    attempts = max_attempts if max_attempts is not None else MYSQL_MAX_ATTEMPTS
+    delays = (1.0, 2.0, 4.0)
+    ok, msg = False, ""
+    for attempt in range(1, attempts + 1):
+        ok, msg = func()
+        if ok:
+            return ok, msg
+        # 設定不足など、リトライしても変わらないものは即座に諦める
+        if str(msg).startswith("skip_update") or str(msg) == "pymysql_not_installed":
+            return ok, msg
+        log_json({
+            "ok": False,
+            "stage": f"{label}_attempt_failed",
+            "attempt": attempt,
+            "max_attempts": attempts,
+            "message": str(msg)[:500],
+        })
+        if attempt < attempts:
+            time.sleep(delays[min(attempt - 1, len(delays) - 1)])
+    return ok, msg
+
+
 def run_ghostscript_normalize(in_pdf: str, out_pdf: str) -> None:
     cmd = [
         "gs",
@@ -155,7 +270,8 @@ def run_ghostscript_normalize(in_pdf: str, out_pdf: str) -> None:
             "timeout_sec": GS_TIMEOUT_SEC,
             "in_pdf": os.path.basename(in_pdf),
         })
-        raise RuntimeError(
+        # タイムアウトは再実行しても同じだけ時間を浪費する可能性が高いのでリトライ対象外にする
+        raise PermanentConversionError(
             f"Ghostscript timed out after {GS_TIMEOUT_SEC}s: {os.path.basename(in_pdf)}"
         )
 
@@ -559,8 +675,10 @@ def downsample_if_too_large(
 
     try:
         from PIL import Image as _PilImage
-        # 巨大画像でも開けるよう DecompressionBomb 制限を緩める
-        _PilImage.MAX_IMAGE_PIXELS = None
+        # 大きめの画像も開けるよう DecompressionBomb 制限を緩める。
+        # ただし None(無制限) にはしない。無制限だと破損画像や極端に大きい画像で
+        # メモリを使い切ってしまい、原因の分かりにくい落ち方をするため。
+        _PilImage.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
         with _PilImage.open(image_path) as img:
             w, h = img.size
@@ -686,6 +804,68 @@ def gcs_upload_with_retry(
                 })
                 time.sleep(wait)
     raise last_err if last_err is not None else RuntimeError("GCS upload: 全リトライ失敗")
+
+
+def gcs_download_with_retry(
+    blob,
+    local_path: str,
+    timeout: int = 60,
+    max_attempts: int = None,
+) -> bool:
+    """
+    GCS からの download_to_filename をタイムアウト＆指数バックオフ付きで実行する。
+    gcs_upload_with_retry と対になる実装。
+      - timeout: 1試行あたりのHTTP timeout（秒）
+      - バックオフ: 1.0秒 → 2.0秒 → 4.0秒
+    成功なら True を返す。すべて失敗した場合は最後の例外を再送出する。
+    """
+    attempts = max_attempts if max_attempts is not None else GCS_MAX_ATTEMPTS
+    delays = [1.0, 2.0, 4.0]
+    last_err: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        log_json({
+            "ok": True,
+            "stage": "gcs_download_attempt",
+            "blob": getattr(blob, "name", str(blob)),
+            "timeout": timeout,
+            "attempt": attempt,
+            "max_attempts": attempts,
+        })
+        try:
+            blob.download_to_filename(local_path, timeout=timeout)
+            try:
+                size_bytes = os.path.getsize(local_path)
+            except Exception:
+                size_bytes = -1
+            log_json({
+                "ok": True,
+                "stage": "gcs_download_done",
+                "blob": getattr(blob, "name", str(blob)),
+                "size_bytes": size_bytes,
+                "attempt": attempt,
+            })
+            return True
+        except Exception as e:
+            last_err = e
+            log_json({
+                "ok": False,
+                "stage": "gcs_download_attempt_failed",
+                "blob": getattr(blob, "name", str(blob)),
+                "attempt": attempt,
+                "max_attempts": attempts,
+                "error": str(e)[:500],
+            })
+            if attempt < attempts:
+                wait = delays[min(attempt - 1, len(delays) - 1)]
+                log_json({
+                    "ok": True,
+                    "stage": "gcs_download_backoff_sleep",
+                    "blob": getattr(blob, "name", str(blob)),
+                    "next_attempt": attempt + 1,
+                    "sleep_seconds": wait,
+                })
+                time.sleep(wait)
+    raise last_err if last_err is not None else RuntimeError("GCS download: 全リトライ失敗")
 
 
 def generate_gcs_signed_url(blob_obj, expiration_hours: int = 168) -> Optional[str]:
@@ -1225,20 +1405,28 @@ def main() -> Dict[str, Any]:
             out_dir = os.path.join(td, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # 1) download PDF
-            bucket_in.blob(in_obj).download_to_filename(in_pdf)
+            # 1) download PDF（一過性の通信エラーに備えてリトライ付き）
+            gcs_download_with_retry(bucket_in.blob(in_obj), in_pdf)
 
-            # 2) normalize PDF
-            run_ghostscript_normalize(in_pdf, fixed_pdf)
+            # 2) normalize PDF（一過性の失敗のみリトライ。不正PDF等は即座に諦める）
+            retry_on_transient(
+                "ghostscript",
+                lambda: run_ghostscript_normalize(in_pdf, fixed_pdf),
+                GS_MAX_ATTEMPTS,
+            )
 
-            # 3) render PNGs
-            png_paths = convert_pdf_to_pngs(
-                fixed_pdf=fixed_pdf,
-                out_dir=out_dir,
-                w=TARGET_W,
-                h=TARGET_H,
-                use_cropbox=USE_CROPBOX,
-                threads=THREAD_COUNT
+            # 3) render PNGs（同上）
+            png_paths = retry_on_transient(
+                "render_pngs",
+                lambda: convert_pdf_to_pngs(
+                    fixed_pdf=fixed_pdf,
+                    out_dir=out_dir,
+                    w=TARGET_W,
+                    h=TARGET_H,
+                    use_cropbox=USE_CROPBOX,
+                    threads=THREAD_COUNT
+                ),
+                RENDER_MAX_ATTEMPTS,
             )
 
             # 4) upload to GCS + Azure OCR + image size
@@ -1398,7 +1586,12 @@ def main() -> Dict[str, Any]:
 
     # img_urls を ai_case に保存
     img_urls_joined = "|,|".join(all_uploaded_images)
-    upd_ok, upd_msg = mysql_update_ai_case_img_urls(ai_case_id=ai_case_id, img_urls_joined=img_urls_joined)
+    upd_ok, upd_msg = retry_db_update(
+        "mysql_update_img_urls",
+        lambda: mysql_update_ai_case_img_urls(
+            ai_case_id=ai_case_id, img_urls_joined=img_urls_joined
+        ),
+    )
     log_json({"ok": upd_ok, "stage": "mysql_update_img_urls", "message": upd_msg})
 
     # ============================
@@ -1509,11 +1702,14 @@ def main() -> Dict[str, Any]:
     request_json_str = json.dumps(db_request, ensure_ascii=False)
     sizes_str = "|,|".join(all_image_sizes)
 
-    upd_full_ok, upd_full_msg = mysql_update_ai_case_full(
-        ai_case_id=ai_case_id,
-        request_json=request_json_str,
-        sizes_str=sizes_str,
-        status="IMED",
+    upd_full_ok, upd_full_msg = retry_db_update(
+        "mysql_update_full",
+        lambda: mysql_update_ai_case_full(
+            ai_case_id=ai_case_id,
+            request_json=request_json_str,
+            sizes_str=sizes_str,
+            status="IMED",
+        ),
     )
     log_json({"ok": upd_full_ok, "stage": "mysql_update_full", "message": upd_full_msg})
 
@@ -1540,4 +1736,4 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         log_json({"ok": False, "error": str(e)})
-        rai
+        raise
